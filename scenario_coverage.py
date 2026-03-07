@@ -38,6 +38,8 @@ class Scenario(BaseScenario):
         local_radius_cells=1,
         age_curve_power=3.0,
         render_style="gradient",  # "gradient" | "binary"
+        speed_type_a=1.0,
+        speed_type_b=1.1666667,
     ):
         super().__init__()
         self.width = float(width)
@@ -55,10 +57,15 @@ class Scenario(BaseScenario):
         self.local_radius_cells = int(local_radius_cells)
         self.age_curve_power = float(age_curve_power)
         self.render_style = str(render_style)
+        self.speed_type_a = float(speed_type_a)
+        self.speed_type_b = float(speed_type_b)
 
         self.type_specs = [
-            AgentTypeSpec("type_A", max_speed=1.0, sensor_range=0.18, color=Color.BLUE.value),
-            AgentTypeSpec("type_B", max_speed=1.5, sensor_range=0.12, color=Color.GREEN.value),
+            # 速度映射说明（按比例）：
+            # 无人艇A:[0,30]节, 无人艇B:[0,35]节
+            # 仿真中采用 A:B = 30:35 = 1.0:1.1666667
+            AgentTypeSpec("type_A", max_speed=self.speed_type_a, sensor_range=0.18, color=Color.BLUE.value),
+            AgentTypeSpec("type_B", max_speed=self.speed_type_b, sensor_range=0.12, color=Color.GREEN.value),
         ]
         self.agent_type_ids = [0, 0, 1, 1]
 

@@ -25,6 +25,16 @@ from scenario_coverage import Scenario
 
 
 def build_env(args, vmas_device):
+    # 无人艇速度按文档比例映射：
+    # A:[0,30]节, B:[0,35]节 -> 仿真 max_speed 比例 1.0 : (35/30)=1.1666667
+    #
+    # 实际尺寸换算约定（用于注释说明）：
+    # - 任务层时间映射：1 step ≈ 1 minute
+    # - A艇 30节 = 55.56 km/h = 0.926 km/min，对应仿真 speed=1.0
+    # - 因此 1.0 仿真长度单位 ≈ 0.926 km（近似）
+    speed_type_a = args.speed_type_a_knots / args.speed_type_a_knots
+    speed_type_b = args.speed_type_b_knots / args.speed_type_a_knots
+
     scenario = Scenario(
         width=args.width,
         height=args.height,
@@ -36,6 +46,8 @@ def build_env(args, vmas_device):
         width_range=(args.width_min, args.width_max),
         height_range=(args.height_min, args.height_max),
         coverage_margin=args.coverage_margin,
+        speed_type_a=speed_type_a,
+        speed_type_b=speed_type_b,
     )
     env = VmasEnv(
         scenario=scenario,
@@ -258,13 +270,25 @@ def main():
     parser.add_argument("--entropy_eps", type=float, default=1e-4)
     parser.add_argument("--max_steps", type=int, default=200)
     parser.add_argument("--num_envs", type=int, default=60)
-    parser.add_argument("--width", type=float, default=1.0)
-    parser.add_argument("--height", type=float, default=1.0)
+    # 区域尺寸联动调整说明：
+    # 旧速度配置平均值: (1.0 + 1.5)/2 = 1.25
+    # 新速度配置平均值: (1.0 + 1.1666667)/2 = 1.08333335
+    # 为保持接近的任务难度，将默认区域按 1.0833/1.25 ≈ 0.8667 缩放。
+    #
+    # 对应实际海域大小（按上面的近似换算）：
+    # - 默认 width=height=0.87 -> 边长约 0.87 * 0.926 = 0.806 km
+    #   即约 0.806 km × 0.806 km，面积约 0.65 km^2
+    # - 随机范围 [0.70, 1.04] -> 边长约 [0.648, 0.963] km
+    #   即面积约 [0.42, 0.93] km^2
+    parser.add_argument("--width", type=float, default=0.87)
+    parser.add_argument("--height", type=float, default=0.87)
     parser.add_argument("--randomize_area", action="store_true")
-    parser.add_argument("--width_min", type=float, default=0.8)
-    parser.add_argument("--width_max", type=float, default=1.2)
-    parser.add_argument("--height_min", type=float, default=0.8)
-    parser.add_argument("--height_max", type=float, default=1.2)
+    parser.add_argument("--width_min", type=float, default=0.70)
+    parser.add_argument("--width_max", type=float, default=1.04)
+    parser.add_argument("--height_min", type=float, default=0.70)
+    parser.add_argument("--height_max", type=float, default=1.04)
+    parser.add_argument("--speed_type_a_knots", type=float, default=30.0)
+    parser.add_argument("--speed_type_b_knots", type=float, default=35.0)
     parser.add_argument("--coverage_margin", type=float, default=0.9)
     parser.add_argument("--grid_w", type=int, default=10)
     parser.add_argument("--grid_h", type=int, default=10)
