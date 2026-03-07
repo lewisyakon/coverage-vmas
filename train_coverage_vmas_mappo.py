@@ -117,7 +117,18 @@ def train(args):
     env = build_env(args, vmas_device)
     policy = build_policy(env, device)
     critic = build_critic(env, device)
-    if args.resume_best:
+    if args.resume_policy or args.resume_critic:
+        if args.resume_policy and os.path.exists(args.resume_policy):
+            policy.load_state_dict(torch.load(args.resume_policy, map_location=device))
+            print(f"[恢复] 已加载策略模型: {args.resume_policy}")
+        else:
+            print("[恢复] 未找到策略模型，改为从头训练")
+        if args.resume_critic and os.path.exists(args.resume_critic):
+            critic.load_state_dict(torch.load(args.resume_critic, map_location=device))
+            print(f"[恢复] 已加载价值模型: {args.resume_critic}")
+        else:
+            print("[恢复] 未找到价值模型，改为从头训练")
+    elif args.resume_best:
         best_policy = os.path.join(args.save_dir, "coverage_vmas_policy_best.pth")
         best_critic = os.path.join(args.save_dir, "coverage_vmas_critic_best.pth")
         if os.path.exists(best_policy) and os.path.exists(best_critic):
@@ -239,7 +250,7 @@ def main():
     parser.add_argument("--n_iters", type=int, default=1500)
     parser.add_argument("--num_epochs", type=int, default=30)
     parser.add_argument("--minibatch_size", type=int, default=400)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--clip_epsilon", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -261,6 +272,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save_dir", type=str, default="models")
     parser.add_argument("--resume_best", action="store_true")
+    parser.add_argument("--resume_policy", type=str, default="")
+    parser.add_argument("--resume_critic", type=str, default="")
     args = parser.parse_args()
     train(args)
 

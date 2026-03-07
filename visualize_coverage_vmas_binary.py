@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VMAS 覆盖任务可视化：导出 MP4
+VMAS 覆盖任务可视化（阈值跳变版）：10分钟内绿色，否则红色
 """
 
 import argparse
@@ -67,10 +67,10 @@ def get_cell_size(env):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VMAS 覆盖任务可视化 (MP4)")
+    parser = argparse.ArgumentParser(description="VMAS 覆盖任务可视化（阈值跳变版）")
     parser.add_argument("--model_path", default="models/coverage_vmas_policy_best.pth")
     parser.add_argument("--out_dir", default="videos")
-    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--fps", type=int, default=5)
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_steps", type=int, default=200)
@@ -102,7 +102,9 @@ def main():
         width_range=(args.width_min, args.width_max),
         height_range=(args.height_min, args.height_max),
         coverage_margin=args.coverage_margin,
+        render_style="binary",
     )
+
     env = VmasEnv(
         scenario=scenario,
         num_envs=1,
@@ -144,7 +146,7 @@ def main():
                     break
                 td = td_next
 
-        out_path = os.path.join(args.out_dir, f"coverage_vmas_episode_{ep + 1}.mp4")
+        out_path = os.path.join(args.out_dir, f"coverage_vmas_binary_episode_{ep + 1}.mp4")
         if frames:
             imageio.mimsave(out_path, frames, fps=args.fps)
             print(f"保存视频: {out_path} (frames={len(frames)})")

@@ -36,6 +36,8 @@ class Scenario(BaseScenario):
         reward_improve_weight=0.5,
         max_age_penalty=0.2,
         local_radius_cells=1,
+        age_curve_power=3.0,
+        render_style="gradient",  # "gradient" | "binary"
     ):
         super().__init__()
         self.width = float(width)
@@ -51,6 +53,8 @@ class Scenario(BaseScenario):
         self.reward_improve_weight = float(reward_improve_weight)
         self.max_age_penalty = float(max_age_penalty)
         self.local_radius_cells = int(local_radius_cells)
+        self.age_curve_power = float(age_curve_power)
+        self.render_style = str(render_style)
 
         self.type_specs = [
             AgentTypeSpec("type_A", max_speed=1.0, sensor_range=0.18, color=Color.BLUE.value),
@@ -185,8 +189,11 @@ class Scenario(BaseScenario):
             self.last_seen = torch.where(covered, step_t, self.last_seen)
 
         age = self.step_count.unsqueeze(1) - self.last_seen
-        fresh = age <= float(self.revisit_limit)
-        self._cached_fresh_ratio = fresh.float().mean(dim=1)
+        # 非线性惩罚：接近阈值惩罚更大
+        age_norm = (age / max(1.0, float(self.revisit_limit))).clamp(0.0, 2.0)
+        age_curve = torch.clamp(age_norm, 0.0, 1.0) ** self.age_curve_power
+        smooth_score = 1.0 - age_curve
+        self._cached_fresh_ratio = smooth_score.mean(dim=1)
         self._cached_max_age = age.max(dim=1).values
         improve = self._cached_fresh_ratio - prev_fresh
         max_age_norm = self._cached_max_age / max(1.0, float(self.revisit_limit))
@@ -250,8 +257,9 @@ class Scenario(BaseScenario):
         dist = torch.linalg.vector_norm(diff, dim=-1)
         local_mask = dist <= radius
         age = self.step_count.unsqueeze(1) - self.last_seen
-        fresh = (age <= float(self.revisit_limit)).float()
-        masked = fresh * local_mask.float()
+        age_norm = (age / max(1.0, float(self.revisit_limit))).clamp(0.0, 2.0)
+        smooth = 1.0 - (torch.clamp(age_norm, 0.0, 1.0) ** self.age_curve_power)
+        masked = smooth * local_mask.float()
         local_sum = masked.sum(dim=1)
         local_cnt = local_mask.sum(dim=1).clamp_min(1.0)
         local_fresh = (local_sum / local_cnt).unsqueeze(-1)
@@ -268,14 +276,56 @@ class Scenario(BaseScenario):
     def extra_render(self, env_index: int = 0):
         # 在渲染中标出“10分钟内覆盖过”的网格
         from vmas.simulator import rendering
+        import math
 
         geoms = []
         cell_w = self.width / self.grid_w
         cell_h = self.height / self.grid_h
 
         age = self.step_count[env_index] - self.last_seen[env_index]
-        fresh = age <= float(self.revisit_limit)
-        fresh = fresh.reshape(self.grid_h, self.grid_w)
+        if self.render_style == "binary":
+            # 阈值跳变：10分钟内绿色，否则红色（仅影响渲染，不影响训练/观测）
+            fresh = age <= float(self.revisit_limit)
+            fresh = fresh.reshape(self.grid_h, self.grid_w)
+            for gy in range(self.grid_h):
+                for gx in range(self.grid_w):
+                    x0 = -self.width / 2.0 + gx * cell_w
+                    y0 = -self.height / 2.0 + gy * cell_h
+                    x1 = x0 + cell_w
+                    y1 = y0 + cell_h
+                    box = rendering.make_polygon(
+                        [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                    )
+                    if bool(fresh[gy, gx].item()):
+                        box.set_color(0.2, 0.8, 0.2, 0.25)
+                    else:
+                        box.set_color(0.8, 0.2, 0.2, 0.10)
+                    geoms.append(box)
+
+            # 标注各 agent 的探测范围（浅色半透明圆）
+            num_pts = 40
+            for agent in self.world.agents:
+                pos = agent.state.pos[env_index]
+                cx, cy = float(pos[0].item()), float(pos[1].item())
+                r = float(getattr(agent, "sensor_range", 0.0))
+                if r <= 0:
+                    continue
+                pts = [
+                    (
+                        cx + r * math.cos(2.0 * math.pi * k / num_pts),
+                        cy + r * math.sin(2.0 * math.pi * k / num_pts),
+                    )
+                    for k in range(num_pts)
+                ]
+                circ = rendering.make_polygon(pts)
+                # 使用 agent 本身颜色，但更浅、更透明
+                col = getattr(agent, "color", (0.9, 0.9, 0.1))
+                circ.set_color(float(col[0]), float(col[1]), float(col[2]), 0.08)
+                geoms.append(circ)
+            return geoms
+        age_norm = (age / max(1.0, float(self.revisit_limit))).clamp(0.0, 2.0)
+        age_curve = torch.clamp(age_norm, 0.0, 1.0) ** self.age_curve_power
+        age_curve = age_curve.reshape(self.grid_h, self.grid_w)
 
         for gy in range(self.grid_h):
             for gx in range(self.grid_w):
@@ -286,9 +336,29 @@ class Scenario(BaseScenario):
                 box = rendering.make_polygon(
                     [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
                 )
-                if bool(fresh[gy, gx].item()):
-                    box.set_color(0.2, 0.8, 0.2, 0.25)
-                else:
-                    box.set_color(0.8, 0.2, 0.2, 0.10)
+                t = float(age_curve[gy, gx].item())
+                r = 0.2 + 0.6 * t
+                g = 0.8 - 0.6 * t
+                box.set_color(r, g, 0.2, 0.25)
                 geoms.append(box)
+
+        # 标注各 agent 的探测范围（浅色半透明圆）
+        num_pts = 40
+        for agent in self.world.agents:
+            pos = agent.state.pos[env_index]
+            cx, cy = float(pos[0].item()), float(pos[1].item())
+            r = float(getattr(agent, "sensor_range", 0.0))
+            if r <= 0:
+                continue
+            pts = [
+                (
+                    cx + r * math.cos(2.0 * math.pi * k / num_pts),
+                    cy + r * math.sin(2.0 * math.pi * k / num_pts),
+                )
+                for k in range(num_pts)
+            ]
+            circ = rendering.make_polygon(pts)
+            col = getattr(agent, "color", (0.9, 0.9, 0.1))
+            circ.set_color(float(col[0]), float(col[1]), float(col[2]), 0.08)
+            geoms.append(circ)
         return geoms
