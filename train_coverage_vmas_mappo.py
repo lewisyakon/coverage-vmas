@@ -5,6 +5,7 @@ VMAS 覆盖任务 MAPPO（方案A：共享Actor + 集中式Critic）
 """
 
 import argparse
+import logging
 import os
 
 import torch
@@ -32,6 +33,9 @@ def build_env(args, vmas_device):
     # - 任务层时间映射：1 step ≈ 1 minute
     # - A艇 30节 = 55.56 km/h = 0.926 km/min，对应仿真 speed=1.0
     # - 因此 1.0 仿真长度单位 ≈ 0.926 km（近似）
+    # 探测范围映射说明：
+    # - 文档口径：A/B 两型无人艇对海探测范围均为 [2,25] km
+    # - 因当前 demo 为归一化场景，先用同一仿真探测半径表示“能力一致”
     speed_type_a = args.speed_type_a_knots / args.speed_type_a_knots
     speed_type_b = args.speed_type_b_knots / args.speed_type_a_knots
 
@@ -46,8 +50,13 @@ def build_env(args, vmas_device):
         width_range=(args.width_min, args.width_max),
         height_range=(args.height_min, args.height_max),
         coverage_margin=args.coverage_margin,
+        overlap_penalty_weight=args.overlap_penalty_weight,
+        same_type_separation_weight=args.same_type_separation_weight,
+        same_type_min_dist_ratio=args.same_type_min_dist_ratio,
         speed_type_a=speed_type_a,
         speed_type_b=speed_type_b,
+        sensor_range_type_a=args.sensor_range_type_a,
+        sensor_range_type_b=args.sensor_range_type_b,
     )
     env = VmasEnv(
         scenario=scenario,
@@ -76,7 +85,8 @@ def build_policy(env, device):
             num_cells=256,
             activation_class=torch.nn.Tanh,
         ),
-        NormalParamExtractor(),
+        # 提高数值稳定性：限制最小方差，避免分布尺度过小/异常导致采样不稳定
+        NormalParamExtractor(scale_lb=1e-3),
     )
     policy_module = TensorDictModule(
         policy_net,
@@ -125,29 +135,47 @@ def train(args):
 
     torch.manual_seed(args.seed)
     set_composite_lp_aggregate(False).set()
+    # 避免 torchrl 的 INFO 日志打断 tqdm 单行进度条显示
+    logging.getLogger("torchrl").setLevel(logging.WARNING)
 
     env = build_env(args, vmas_device)
     policy = build_policy(env, device)
     critic = build_critic(env, device)
+    steps_per_batch = args.frames_per_batch // args.num_envs if args.num_envs > 0 else args.frames_per_batch
+    if steps_per_batch < args.max_steps:
+        print(
+            "[提示] 当前每批步数小于单回合长度："
+            f"steps_per_batch={steps_per_batch}, max_steps={args.max_steps}。"
+            "若直接记录批末episode_reward会出现固定交替。"
+        )
+        print(
+            "[建议] 可将 --frames_per_batch 设为 num_envs*max_steps 的倍数。"
+            f"例如当前可用: {args.num_envs * args.max_steps}。"
+        )
+
+    def try_load_state_dict(module, ckpt_path, module_name):
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            return False
+        try:
+            module.load_state_dict(torch.load(ckpt_path, map_location=device))
+            print(f"[恢复] 已加载{module_name}: {ckpt_path}")
+            return True
+        except RuntimeError as e:
+            print(f"[恢复] 跳过{module_name}加载（结构不兼容，通常是观测维度变更）: {ckpt_path}")
+            print(f"[恢复] 详细原因: {e}")
+            return False
+
     if args.resume_policy or args.resume_critic:
-        if args.resume_policy and os.path.exists(args.resume_policy):
-            policy.load_state_dict(torch.load(args.resume_policy, map_location=device))
-            print(f"[恢复] 已加载策略模型: {args.resume_policy}")
-        else:
+        if not try_load_state_dict(policy, args.resume_policy, "策略模型"):
             print("[恢复] 未找到策略模型，改为从头训练")
-        if args.resume_critic and os.path.exists(args.resume_critic):
-            critic.load_state_dict(torch.load(args.resume_critic, map_location=device))
-            print(f"[恢复] 已加载价值模型: {args.resume_critic}")
-        else:
+        if not try_load_state_dict(critic, args.resume_critic, "价值模型"):
             print("[恢复] 未找到价值模型，改为从头训练")
     elif args.resume_best:
         best_policy = os.path.join(args.save_dir, "coverage_vmas_policy_best.pth")
         best_critic = os.path.join(args.save_dir, "coverage_vmas_critic_best.pth")
-        if os.path.exists(best_policy) and os.path.exists(best_critic):
-            policy.load_state_dict(torch.load(best_policy, map_location=device))
-            critic.load_state_dict(torch.load(best_critic, map_location=device))
-            print(f"[恢复] 已加载最佳模型: {best_policy}, {best_critic}")
-        else:
+        ok_p = try_load_state_dict(policy, best_policy, "最佳策略模型")
+        ok_c = try_load_state_dict(critic, best_critic, "最佳价值模型")
+        if not (ok_p and ok_c):
             print("[恢复] 未找到最佳模型，改为从头训练")
 
     collector = SyncDataCollector(
@@ -170,7 +198,9 @@ def train(args):
         critic_network=critic,
         clip_epsilon=args.clip_epsilon,
         entropy_coeff=args.entropy_eps,
-        normalize_advantage=False,
+        normalize_advantage=True,
+        # 多智能体下避免跨 agent 维做归一化统计，减少训练抖动
+        normalize_advantage_exclude_dims=(-2, -1),
     )
     loss_module.set_keys(
         reward=env.reward_key,
@@ -184,8 +214,9 @@ def train(args):
 
     optim = torch.optim.Adam(loss_module.parameters(), args.lr)
 
-    pbar = tqdm(total=args.n_iters, desc="episode_reward_mean = 0")
+    pbar = tqdm(total=args.n_iters, desc="episode_reward_mean = 0", dynamic_ncols=True, mininterval=0.5)
     best_score = -float("inf")
+    last_complete_episode_mean = None
     for tensordict_data in collector:
         tensordict_data.set(
             ("next", "agents", "done"),
@@ -219,10 +250,27 @@ def train(args):
                     + loss_vals["loss_critic"]
                     + loss_vals["loss_entropy"]
                 )
+                # 防炸保护：若 loss 非有限值，跳过本次更新
+                if not torch.isfinite(loss_value):
+                    optim.zero_grad(set_to_none=True)
+                    continue
                 loss_value.backward()
-                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    loss_module.parameters(), args.max_grad_norm, error_if_nonfinite=False
+                )
+                if isinstance(grad_norm, torch.Tensor) and not torch.isfinite(grad_norm):
+                    optim.zero_grad(set_to_none=True)
+                    continue
+                has_bad_grad = False
+                for p in loss_module.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        has_bad_grad = True
+                        break
+                if has_bad_grad:
+                    optim.zero_grad(set_to_none=True)
+                    continue
                 optim.step()
-                optim.zero_grad()
+                optim.zero_grad(set_to_none=True)
 
         collector.update_policy_weights_()
 
@@ -230,7 +278,8 @@ def train(args):
         ep_rew = tensordict_data.get(("next", "agents", "episode_reward"))
         if done_base.ndim == 3:
             done_base = done_base.squeeze(-1)
-        if done_base.any():
+        done_any = bool(done_base.any().item())
+        if done_any:
             steps = done_base.shape[1]
             t_idx = torch.arange(steps, device=done_base.device).unsqueeze(0)
             last_done_idx = (done_base.float() * t_idx).max(dim=1).values.long()
@@ -239,16 +288,28 @@ def train(args):
             no_done = ~done_base.any(dim=1)
             if no_done.any():
                 end_rew[no_done] = ep_rew[no_done, -1]
-            episode_reward_mean = end_rew.mean().item()
+            last_complete_episode_mean = end_rew.mean().item()
+            episode_reward_mean = last_complete_episode_mean
         else:
-            episode_reward_mean = ep_rew[:, -1].mean().item()
+            # 无完整回合结束时，沿用最近一次“完整回合”的均值，避免半回合值造成固定高低交替
+            if last_complete_episode_mean is None:
+                episode_reward_mean = ep_rew[:, -1].mean().item()
+            else:
+                episode_reward_mean = last_complete_episode_mean
 
-        if episode_reward_mean > best_score:
+        if done_any and episode_reward_mean > best_score:
             best_score = episode_reward_mean
             os.makedirs(args.save_dir, exist_ok=True)
-            torch.save(policy.state_dict(), os.path.join(args.save_dir, "coverage_vmas_policy_best.pth"))
-            torch.save(critic.state_dict(), os.path.join(args.save_dir, "coverage_vmas_critic_best.pth"))
-        pbar.set_description(f"episode_reward_mean = {episode_reward_mean:.3f}", refresh=False)
+            best_policy_path = os.path.join(args.save_dir, "coverage_vmas_policy_best.pth")
+            best_critic_path = os.path.join(args.save_dir, "coverage_vmas_critic_best.pth")
+            torch.save(policy.state_dict(), best_policy_path)
+            torch.save(critic.state_dict(), best_critic_path)
+            tqdm.write(
+                f"[NEW BEST] episode_reward_mean={best_score:.3f} | "
+                f"saved: {best_policy_path}, {best_critic_path}"
+            )
+        pbar.set_description(f"episode_reward_mean = {episode_reward_mean:.3f}", refresh=True)
+        pbar.set_postfix(best=f"{best_score:.3f}", refresh=False)
         pbar.update()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -262,7 +323,8 @@ def main():
     parser.add_argument("--n_iters", type=int, default=1500)
     parser.add_argument("--num_epochs", type=int, default=30)
     parser.add_argument("--minibatch_size", type=int, default=400)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    # 二值奖励+大场景下梯度波动更大，默认学习率下调提升稳定性
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--clip_epsilon", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -270,25 +332,33 @@ def main():
     parser.add_argument("--entropy_eps", type=float, default=1e-4)
     parser.add_argument("--max_steps", type=int, default=200)
     parser.add_argument("--num_envs", type=int, default=60)
-    # 区域尺寸联动调整说明：
-    # 旧速度配置平均值: (1.0 + 1.5)/2 = 1.25
-    # 新速度配置平均值: (1.0 + 1.1666667)/2 = 1.08333335
-    # 为保持接近的任务难度，将默认区域按 1.0833/1.25 ≈ 0.8667 缩放。
-    #
-    # 对应实际海域大小（按上面的近似换算）：
-    # - 默认 width=height=0.87 -> 边长约 0.87 * 0.926 = 0.806 km
-    #   即约 0.806 km × 0.806 km，面积约 0.65 km^2
-    # - 随机范围 [0.70, 1.04] -> 边长约 [0.648, 0.963] km
-    #   即面积约 [0.42, 0.93] km^2
-    parser.add_argument("--width", type=float, default=0.87)
-    parser.add_argument("--height", type=float, default=0.87)
+    # 区域尺寸按“探测上限 25km”重标定（1 step≈1min, A艇30节=>0.926km/min 对应 speed=1.0）：
+    # - 1.0 仿真长度单位 ≈ 0.926 km
+    # - 无人艇最大探测半径 25km => 25 / 0.926 ≈ 27.0 仿真单位
+    # - 4艘艇瞬时理论覆盖上限约 4 * pi * 25^2 = 7852 km^2（不计重叠）
+    # - 10分钟动态扫掠上限（直线近似）：
+    #   单艇 A_10min ≈ pi*r^2 + 2*r*L, 其中 L≈(0.926~1.08)*10 ≈ 9.3~10.8 km
+    #   取 L≈10km 时单艇约 2463 km^2，4艇总计约 9850 km^2（不计重叠）
+    # 因此默认海域设置为约 95km x 95km（约 8570 km^2）：
+    # - 明显大于瞬时上限 7852 km^2（避免过易）
+    # - 低于动态上限 9850 km^2（在协同良好时可行）
+    parser.add_argument("--width", type=float, default=103.0)
+    parser.add_argument("--height", type=float, default=103.0)
     parser.add_argument("--randomize_area", action="store_true")
-    parser.add_argument("--width_min", type=float, default=0.70)
-    parser.add_argument("--width_max", type=float, default=1.04)
-    parser.add_argument("--height_min", type=float, default=0.70)
-    parser.add_argument("--height_max", type=float, default=1.04)
+    parser.add_argument("--width_min", type=float, default=95.0)
+    parser.add_argument("--width_max", type=float, default=110.0)
+    parser.add_argument("--height_min", type=float, default=95.0)
+    parser.add_argument("--height_max", type=float, default=110.0)
     parser.add_argument("--speed_type_a_knots", type=float, default=30.0)
     parser.add_argument("--speed_type_b_knots", type=float, default=35.0)
+    # A/B 两型无人艇文档中探测范围同为 [2,25]km。
+    # 这里按“上限 25km”配置探测半径：25 / 0.926 ≈ 27.0（仿真单位）
+    parser.add_argument("--sensor_range_type_a", type=float, default=27.0)
+    parser.add_argument("--sensor_range_type_b", type=float, default=27.0)
+    # 防止同类抱团/探测圈重叠过大
+    parser.add_argument("--overlap_penalty_weight", type=float, default=0.10)
+    parser.add_argument("--same_type_separation_weight", type=float, default=0.12)
+    parser.add_argument("--same_type_min_dist_ratio", type=float, default=0.40)
     parser.add_argument("--coverage_margin", type=float, default=0.9)
     parser.add_argument("--grid_w", type=int, default=10)
     parser.add_argument("--grid_h", type=int, default=10)

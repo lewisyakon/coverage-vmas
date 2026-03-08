@@ -19,8 +19,23 @@ from scenario_coverage import Scenario
 from train_coverage_vmas_mappo import build_policy
 
 
+def set_fixed_camera(env, padding_ratio=0.02):
+    """Fix camera by locking scenario zoom/origin used by VMAS render()."""
+    base_env = env.base_env
+    scenario = base_env.scenario
+    device = base_env.device
+    half_w = scenario.width * 0.5 * (1.0 + padding_ratio)
+    half_h = scenario.height * 0.5 * (1.0 + padding_ratio)
+    # VMAS shared_viewer branch final cam_range roughly scales as zoom^2.
+    # Set zoom so that final visible half-range is at least the scenario bounds.
+    target_half = max(float(half_w), float(half_h))
+    scenario.viewer_zoom = max(1e-6, target_half ** 0.5)
+    scenario.render_origin = torch.zeros(2, device=device)
+
+
 def render_frame(env):
-    frame = None
+    # VMAS render() recomputes bounds every frame; lock zoom/origin beforehand.
+    set_fixed_camera(env)
     try:
         frame = env.render(mode="rgb_array")
     except TypeError:
@@ -74,16 +89,22 @@ def main():
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_steps", type=int, default=200)
-    parser.add_argument("--width", type=float, default=1.0)
-    parser.add_argument("--height", type=float, default=1.0)
+    # 与训练脚本保持一致的默认量纲：
+    # 约 95km x 95km -> 仿真约 103 x 103（1.0仿真长度单位≈0.926km）
+    parser.add_argument("--width", type=float, default=103.0)
+    parser.add_argument("--height", type=float, default=103.0)
     parser.add_argument("--grid_w", type=int, default=10)
     parser.add_argument("--grid_h", type=int, default=10)
     parser.add_argument("--revisit_limit", type=int, default=10)
     parser.add_argument("--randomize_area", action="store_true")
-    parser.add_argument("--width_min", type=float, default=0.8)
-    parser.add_argument("--width_max", type=float, default=1.2)
-    parser.add_argument("--height_min", type=float, default=0.8)
-    parser.add_argument("--height_max", type=float, default=1.2)
+    parser.add_argument("--width_min", type=float, default=95.0)
+    parser.add_argument("--width_max", type=float, default=110.0)
+    parser.add_argument("--height_min", type=float, default=95.0)
+    parser.add_argument("--height_max", type=float, default=110.0)
+    parser.add_argument("--speed_type_a_knots", type=float, default=30.0)
+    parser.add_argument("--speed_type_b_knots", type=float, default=35.0)
+    parser.add_argument("--sensor_range_type_a", type=float, default=27.0)
+    parser.add_argument("--sensor_range_type_b", type=float, default=27.0)
     parser.add_argument("--coverage_margin", type=float, default=0.9)
     args = parser.parse_args()
 
@@ -91,6 +112,8 @@ def main():
     device = torch.device(0) if torch.cuda.is_available() and not is_fork else torch.device("cpu")
     vmas_device = device
 
+    speed_type_a = args.speed_type_a_knots / args.speed_type_a_knots
+    speed_type_b = args.speed_type_b_knots / args.speed_type_a_knots
     scenario = Scenario(
         width=args.width,
         height=args.height,
@@ -102,6 +125,10 @@ def main():
         width_range=(args.width_min, args.width_max),
         height_range=(args.height_min, args.height_max),
         coverage_margin=args.coverage_margin,
+        speed_type_a=speed_type_a,
+        speed_type_b=speed_type_b,
+        sensor_range_type_a=args.sensor_range_type_a,
+        sensor_range_type_b=args.sensor_range_type_b,
     )
     env = VmasEnv(
         scenario=scenario,
