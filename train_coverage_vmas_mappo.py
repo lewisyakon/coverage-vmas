@@ -324,7 +324,7 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=30)
     parser.add_argument("--minibatch_size", type=int, default=400)
     # 二值奖励+大场景下梯度波动更大，默认学习率下调提升稳定性
-    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--clip_epsilon", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=0.99)

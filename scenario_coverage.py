@@ -41,7 +41,7 @@ class Scenario(BaseScenario):
         same_type_min_dist_ratio=0.40,
         local_radius_cells=1,
         age_curve_power=3.0,
-        render_style="gradient",  # "gradient" | "binary"
+        render_style="gradient",  # "gradient" | "binary" | "none"
         speed_type_a=1.0,
         speed_type_b=1.1666667,
         sensor_range_type_a=0.18,
@@ -210,9 +210,11 @@ class Scenario(BaseScenario):
             self.last_seen = torch.where(covered, step_t, self.last_seen)
 
         age = self.step_count.unsqueeze(1) - self.last_seen
-        # 回退为二值化新鲜度：age<=revisit_limit 记为新鲜，否则过期
-        fresh_mask = age <= float(self.revisit_limit)
-        self._cached_fresh_ratio = fresh_mask.float().mean(dim=1)
+        # 渐进式新鲜度惩罚：接近阈值时惩罚更大（而非二值跳变）
+        age_norm = (age / max(1.0, float(self.revisit_limit))).clamp(0.0, 2.0)
+        age_curve = torch.clamp(age_norm, 0.0, 1.0) ** self.age_curve_power
+        smooth_score = 1.0 - age_curve
+        self._cached_fresh_ratio = smooth_score.mean(dim=1)
         self._cached_max_age = age.max(dim=1).values
         improve = self._cached_fresh_ratio - prev_fresh
         max_age_norm = self._cached_max_age / max(1.0, float(self.revisit_limit))
@@ -300,7 +302,7 @@ class Scenario(BaseScenario):
             dim=-1,
         )
 
-        # 局部覆盖提示：以自身为中心的 3x3 近邻二值新鲜度均值
+        # 局部覆盖提示：以自身为中心的 3x3 近邻平滑新鲜度均值
         cell_w = self.width / self.grid_w
         cell_h = self.height / self.grid_h
         radius = max(cell_w, cell_h) * (self.local_radius_cells + 0.5)
@@ -308,8 +310,9 @@ class Scenario(BaseScenario):
         dist = torch.linalg.vector_norm(diff, dim=-1)
         local_mask = dist <= radius
         age = self.step_count.unsqueeze(1) - self.last_seen
-        fresh_binary = (age <= float(self.revisit_limit)).float()
-        masked = fresh_binary * local_mask.float()
+        age_norm = (age / max(1.0, float(self.revisit_limit))).clamp(0.0, 2.0)
+        smooth = 1.0 - (torch.clamp(age_norm, 0.0, 1.0) ** self.age_curve_power)
+        masked = smooth * local_mask.float()
         local_sum = masked.sum(dim=1)
         local_cnt = local_mask.sum(dim=1).clamp_min(1.0)
         local_fresh = (local_sum / local_cnt).unsqueeze(-1)
@@ -334,7 +337,7 @@ class Scenario(BaseScenario):
             teammate_rel = torch.zeros((self.world.batch_dim, 0), device=self.world.device, dtype=torch.float32)
 
         # 额外全局信息2：全局覆盖热图（10x10 -> 5x5 平均池化，25维）
-        fresh_map = fresh_binary.reshape(self.world.batch_dim, self.grid_h, self.grid_w).unsqueeze(1)
+        fresh_map = smooth.reshape(self.world.batch_dim, self.grid_h, self.grid_w).unsqueeze(1)
         pooled = F.adaptive_avg_pool2d(fresh_map, (5, 5)).squeeze(1)
         global_heatmap = pooled.reshape(self.world.batch_dim, -1)
 
@@ -366,6 +369,27 @@ class Scenario(BaseScenario):
         cell_h = self.height / self.grid_h
 
         age = self.step_count[env_index] - self.last_seen[env_index]
+        if self.render_style == "none":
+            # 不渲染网格方块，仅渲染各 agent 探测范围圈
+            num_pts = 40
+            for agent in self.world.agents:
+                pos = agent.state.pos[env_index]
+                cx, cy = float(pos[0].item()), float(pos[1].item())
+                r = float(getattr(agent, "sensor_range", 0.0))
+                if r <= 0:
+                    continue
+                pts = [
+                    (
+                        cx + r * math.cos(2.0 * math.pi * k / num_pts),
+                        cy + r * math.sin(2.0 * math.pi * k / num_pts),
+                    )
+                    for k in range(num_pts)
+                ]
+                circ = rendering.make_polygon(pts)
+                col = getattr(agent, "color", (0.9, 0.9, 0.1))
+                circ.set_color(float(col[0]), float(col[1]), float(col[2]), 0.08)
+                geoms.append(circ)
+            return geoms
         if self.render_style == "binary":
             # 阈值跳变：10分钟内绿色，否则红色（仅影响渲染，不影响训练/观测）
             fresh = age <= float(self.revisit_limit)
