@@ -35,7 +35,9 @@ class Scenario(BaseScenario):
         height_range=(0.8, 1.2),
         coverage_margin=0.9,
         reward_improve_weight=0.5,
-        max_age_penalty=0.2,
+        max_age_penalty=0.5,
+        oldest_repair_weight=0.35,
+        oldest_k_ratio=0.12,
         overlap_penalty_weight=0.10,
         same_type_separation_weight=0.12,
         same_type_min_dist_ratio=0.40,
@@ -60,6 +62,8 @@ class Scenario(BaseScenario):
         self.coverage_margin = float(coverage_margin)
         self.reward_improve_weight = float(reward_improve_weight)
         self.max_age_penalty = float(max_age_penalty)
+        self.oldest_repair_weight = float(oldest_repair_weight)
+        self.oldest_k_ratio = float(oldest_k_ratio)
         self.overlap_penalty_weight = float(overlap_penalty_weight)
         self.same_type_separation_weight = float(same_type_separation_weight)
         self.same_type_min_dist_ratio = float(same_type_min_dist_ratio)
@@ -201,6 +205,7 @@ class Scenario(BaseScenario):
         self.step_count += 1.0
 
         prev_fresh = self._cached_fresh_ratio.clone()
+        last_seen_before = self.last_seen.clone()
         for agent in self.world.agents:
             pos = agent.state.pos  # (batch, 2)
             diff = self.grid_centers.unsqueeze(0) - pos.unsqueeze(1)
@@ -217,6 +222,15 @@ class Scenario(BaseScenario):
         self._cached_fresh_ratio = smooth_score.mean(dim=1)
         self._cached_max_age = age.max(dim=1).values
         improve = self._cached_fresh_ratio - prev_fresh
+        # 新增“最老区域修复奖励”：优先鼓励去修复当前最老的那一批网格
+        # baseline：若本步不被探测，年龄应为 step_t - last_seen_before
+        age_no_cov = self.step_count.unsqueeze(1) - last_seen_before
+        age_reduction = (age_no_cov - age).clamp_min(0.0)
+        num_cells = age.shape[1]
+        k = max(1, min(num_cells, int(round(num_cells * self.oldest_k_ratio))))
+        oldest_idx = torch.topk(age_no_cov, k=k, dim=1).indices
+        oldest_reduction = torch.gather(age_reduction, dim=1, index=oldest_idx)
+        oldest_repair_reward = (oldest_reduction / max(1.0, float(self.revisit_limit))).mean(dim=1)
         max_age_norm = self._cached_max_age / max(1.0, float(self.revisit_limit))
         max_age_norm = max_age_norm.clamp(0.0, 2.0)
         # 编队去重约束：
@@ -253,6 +267,7 @@ class Scenario(BaseScenario):
             self._cached_fresh_ratio
             + self.reward_improve_weight * improve
             - self.max_age_penalty * max_age_norm
+            + self.oldest_repair_weight * oldest_repair_reward
             - self.overlap_penalty_weight * overlap_penalty
             - self.same_type_separation_weight * same_type_penalty
         )

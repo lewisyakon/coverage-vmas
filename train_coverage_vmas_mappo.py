@@ -50,6 +50,10 @@ def build_env(args, vmas_device):
         width_range=(args.width_min, args.width_max),
         height_range=(args.height_min, args.height_max),
         coverage_margin=args.coverage_margin,
+        reward_improve_weight=args.reward_improve_weight,
+        max_age_penalty=args.max_age_penalty,
+        oldest_repair_weight=args.oldest_repair_weight,
+        oldest_k_ratio=args.oldest_k_ratio,
         overlap_penalty_weight=args.overlap_penalty_weight,
         same_type_separation_weight=args.same_type_separation_weight,
         same_type_min_dist_ratio=args.same_type_min_dist_ratio,
@@ -355,6 +359,11 @@ def main():
     # 这里按“上限 25km”配置探测半径：25 / 0.926 ≈ 27.0（仿真单位）
     parser.add_argument("--sensor_range_type_a", type=float, default=27.0)
     parser.add_argument("--sensor_range_type_b", type=float, default=27.0)
+    # 奖励项权重：强化“修复最老区域”，抑制固定区域摆动
+    parser.add_argument("--reward_improve_weight", type=float, default=0.5)
+    parser.add_argument("--max_age_penalty", type=float, default=0.5)
+    parser.add_argument("--oldest_repair_weight", type=float, default=0.35)
+    parser.add_argument("--oldest_k_ratio", type=float, default=0.12)
     # 防止同类抱团/探测圈重叠过大
     parser.add_argument("--overlap_penalty_weight", type=float, default=0.10)
     parser.add_argument("--same_type_separation_weight", type=float, default=0.12)
